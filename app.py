@@ -99,6 +99,7 @@ def analyze_news_sentiment(articles):
         try:
             # Extract text content
             text = f"{article.get('title', '')}. {article.get('description', '')}"[:512]
+            category = categorize_esg(text)
             
             # Handle date parsing with multiple fallbacks
             pub_date = article.get('publishedAt')
@@ -126,8 +127,10 @@ def analyze_news_sentiment(articles):
                 "date": date,
                 "text": text,
                 "sentiment": result["label"].capitalize(),
-                "score": score
+                "score": score,
+                "category": category  # New field
             })
+
         except Exception as e:
             st.warning(f"Skipped article due to error: {str(e)}")
             continue
@@ -135,7 +138,7 @@ def analyze_news_sentiment(articles):
     return pd.DataFrame(results)
 
 def prepare_training_data(sentiment_df, stock_df):
-    """Align sentiment and price data with timezone normalization"""
+    """Align sentiment and price data with ESG categories"""
     # Convert all dates to UTC
     stock_df['Date'] = pd.to_datetime(stock_df['Date']).dt.tz_convert('UTC')
     sentiment_df['date'] = pd.to_datetime(sentiment_df['date']).dt.tz_convert('UTC')
@@ -148,15 +151,54 @@ def prepare_training_data(sentiment_df, stock_df):
         direction='forward'
     )
     
-    # Create features (keep existing code)
+    # Create features
     merged['price_change'] = merged['Close'].pct_change() * 100
     merged['sentiment_ma'] = merged['score'].rolling(3).mean()
     merged['news_count'] = merged.groupby('date')['score'].transform('count')
     merged['target'] = merged['price_change'].shift(-1)
-    merged = merged.dropna(subset=['score', 'sentiment_ma', 'news_count', 'target'])
-    merged = merged[merged['news_count'] > 0]  # Filter days with news
+
+    # Handle ESG categories - FIXED
+    # Get dummy variables for categories and ensure all expected columns exist
+    merged = pd.get_dummies(merged, columns=['category'], prefix='cat')
     
-    return merged.dropna()
+    # Ensure all expected category columns are present
+    expected_categories = ['cat_Environmental', 'cat_Social', 'cat_Governance', 'cat_Other']
+    for cat in expected_categories:
+        if cat not in merged.columns:
+            merged[cat] = 0  # Add missing columns with 0 values
+
+    # Define features list with fallbacks
+    base_features = ['score', 'sentiment_ma', 'news_count']
+    category_features = [c for c in expected_categories if c in merged.columns]
+    features = base_features + category_features
+
+    # Filter and return
+    merged = merged.dropna(subset=features + ['target'])
+    return merged[features + ['target', 'Date', 'Close']].dropna()
+
+ESG_CATEGORIES = {
+    "Environmental": [
+        'climate', 'emission', 'carbon', 'energy', 'renewable',
+        'sustainable', 'pollution', 'environment', 'green', 'waste'
+    ],
+    "Social": [
+        'diversity', 'equality', 'community', 'human rights', 'labor',
+        'health', 'safety', 'education', 'philanthropy', 'inclusion'
+    ],
+    "Governance": [
+        'board', 'executive', 'compensation', 'ethics', 'regulation',
+        'compliance', 'audit', 'shareholder', 'transparency', 'fraud'
+    ]
+}
+
+def categorize_esg(text):
+    """Categorize news into E/S/G using keyword matching"""
+    text_lower = text.lower()
+    for category, keywords in ESG_CATEGORIES.items():
+        if any(keyword in text_lower for keyword in keywords):
+            return category
+    return "Other"
+
 
 # ------------------------
 # Streamlit UI - Redesigned
@@ -528,6 +570,27 @@ try:
         col1, col2 = st.columns([1, 1])
         
         with col1:
+            
+            category_dist = sentiment_df['category'].value_counts()
+            source = pd.DataFrame({
+                'Category': category_dist.index,
+                'Count': category_dist.values
+            })
+            
+            pie = alt.Chart(source).mark_arc().encode(
+                theta='Count:Q',
+                color=alt.Color('Category:N', scale=alt.Scale(
+                    domain=['Environmental', 'Social', 'Governance', 'Other'],
+                    range=['#4CAF50', '#2196F3', '#9C27B0', '#666666']
+                )),
+                tooltip=['Category', 'Count']
+            ).properties(
+                title='News Category Distribution',
+                height=300
+            )
+            st.altair_chart(pie, use_container_width=True)
+
+            
             st.markdown("#### 📈 Sentiment Timeline")
             sentiment_chart = sentiment_df.resample('D', on='date').mean(numeric_only=True)
             
@@ -550,6 +613,25 @@ try:
             st.altair_chart(timeline_chart, use_container_width=True)
         
         with col2:
+            
+            sentiment_summary = sentiment_df.groupby(['category', 'sentiment']).size().reset_index(name='count')
+        
+            bars = alt.Chart(sentiment_summary).mark_bar().encode(
+                x=alt.X('category:N', title='Category'),
+                y=alt.Y('sum(count):Q', title='Number of Articles'),
+                color=alt.Color('sentiment:N', scale=alt.Scale(
+                    domain=['Positive', 'Negative', 'Neutral'],
+                    range=['#4CAF50', '#F44336', '#FFC107']
+                )),
+                tooltip=['category', 'sentiment', 'count']
+            ).properties(
+                title='Sentiment by ESG Category',
+                height=300
+            )
+            
+            st.altair_chart(bars, use_container_width=True)
+
+            
             st.markdown("#### 📰 Latest Headlines")
             
             # Display a scrollable container for headlines
